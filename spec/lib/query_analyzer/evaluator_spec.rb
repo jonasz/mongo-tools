@@ -5,30 +5,97 @@ describe Evaluator do
     Evaluator.new 'localhost', 27017
   }
 
-  let(:test_collection_name) {
-    $test_collection_name = "indexTest"
+  let(:test_coll_name) {
+    "indexTest"
   }
 
-# populate database
-  before :each do
-    coll = MongoMapper.database.collection(test_collection_name)
-    # insert some random data
-    10.times do |i|
-      rname = (0...8).map{65.+(rand(26)).chr}.join
-      rartist = (0...8).map{65.+(rand(26)).chr}.join
-      coll.insert({'name'=> rname, 'artist'=> rartist, 'duration'=> Random.rand(100), 'price'=> Random.rand(100), 'rating'=> Random.rand(10)})
+  let(:test_coll_namespace) {
+    MongoMapper.database.full_collection_name(test_coll_name)
+  }
+
+  let(:test_coll) {
+    MongoMapper.database.collection(test_coll_name)
+  }
+
+  def ensureIndexQuality(query, sort_hash, index)
+    #convert sort_hash into an array accepted by the Ruby driver
+    sort_by = []
+    sort_hash.each do |field, val|
+      sort_by.append([field, val>0 ? Mongo::ASCENDING : Mongo::DESCENDING])
     end
-    coll.insert({ "location" => { "x" => -10, "y" => 10 } })
+
+    # performance statistics without the index
+    before = test_coll.find(query).sort(sort_by).explain
+
+    test_coll.ensure_index(index)
+    index_hash = {}
+    index.each { |a,b| index_hash[a] = b }
+    # performance statistics with the index
+    after = test_coll.find(query, :hint => index_hash).sort(sort_by).explain
+
+    if sort_hash.size > 0
+      # The server does not need to sort the outcome.
+      expect(after['scanAndOrder']).to eq(nil)
+    else
+      # The number of scanned objects is improved.
+      expect(before['nscanned']).to be > before['n']
+      expect(after['nscanned']).to eq(after['n'])
+    end
+
+    # These statistics are useful during development.
+    # I'm commenting it out to keep the rspec test suite silent. If you want to
+    # uncomment it, I recommend running rspec with '--format documentation'
+    #
+    # printf "%20s: %s\n", "query", query
+    # printf "%20s: %s\n", "sort_hash", sort_hash
+    # printf "%20s: %s\n", "index", index
+    # interesting = %w{nscanned nscannedObjects n indexOnly scanAndOrder cursor}
+    # interesting.each do |key|
+    #   printf "%20s: %8s -> %8s\n", key, before[key], after[key]
+    # end
+  end
+
+  # populate database
+  before :each do
+    # insert some data
+    names = ['Apple', 'Orange']
+    artists = ['Sting', 'Frank Zappa']
+    durations = [40,50,60,70]
+    prices = [10,20,30]
+    ratings = [6,7,8]
+    c = 0
+
+    entries = names.product(artists, durations, prices, ratings)
+
+    entries.each do |name, artist, duration, price, rating|
+      test_coll.insert({
+        'name' => name,
+        'artist' => artist,
+        'duration' => duration,
+        'price' => price,
+        'rating' => rating,
+        'C' => c
+      })
+      c += 1
+    end
+    test_coll.insert({ "location" => { "x" => -10, "y" => 10 } })
 
     # create indexes
-    coll.ensure_index([['duration', Mongo::ASCENDING], ['name', Mongo::ASCENDING]])
-    coll.ensure_index([['duration', Mongo::ASCENDING], ['rating', Mongo::ASCENDING], ['price', Mongo::ASCENDING]])
-    coll.create_index([['location', Mongo::GEO2D]])
+    test_coll.ensure_index([
+      ['duration', Mongo::ASCENDING],
+      ['name', Mongo::ASCENDING]
+    ])
+    test_coll.ensure_index([
+      ['duration', Mongo::ASCENDING],
+      ['rating', Mongo::ASCENDING],
+      ['price', Mongo::ASCENDING]
+    ])
+    test_coll.create_index([['location', Mongo::GEO2D]])
   end
 
   # clean up collection and indexes
   after :each do
-    MongoMapper.database.drop_collection(test_collection_name)
+    MongoMapper.database.drop_collection(test_coll_name)
   end
 
   def perform_query(query, expected_outcome)
@@ -222,29 +289,33 @@ describe Evaluator do
 
     it "Suggests indexes with optimal order of fields." do
       query = {
-        "B" => { "$in" => [24.0, 25.0, 28.0, 29.0]},
-        "A" => { "$gt" => 27.3}
+        "duration" => { "$in" => [60,70,75,85]},
+        "price" => { "$gt" => 27.3}
       }
       sort_hash = { "C" => 1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
       expect(result[0].raw_index).to \
-        eq("{ 'C': 1, 'B': 1, 'A': 1 }")
+        eq("{ 'C': 1, 'duration': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+
+      ensureIndexQuality(query, sort_hash, result[0].index)
 
 
       # example given by
       # http://java.dzone.com/articles/optimizing-mongodb-compound?mz=36885-nosql
       query = {
-        "timestamp" => { "$gte" => 2, "$lte" => 4 },
-        "anonymous" => false
+        "price" => { "$gte" => 14, "$lte" => 34 },
+        "name" => "Orange"
       }
       sort_hash = { "rating" => -1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
       expect(result[0].raw_index).to \
-        eq ("{ 'anonymous': 1, 'rating': 1, 'timestamp': 1 }")
+        eq ("{ 'name': 1, 'rating': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+
+      ensureIndexQuality(query, sort_hash, result[0].index)
 
 
       query = {
@@ -263,21 +334,26 @@ describe Evaluator do
     end
 
     it "Does not suggest indexes for fields with unsupported operators." do
-      query = { "B" => { "$regex" => "^acme.*corp.*$" }, "A" => { "$gt" => 27.3}}
+      query = {
+        "name" => { "$regex" => "^acme.*corp.*$" },
+        "price" => { "$gt" => 27.3}
+      }
       sort_hash = { "C" => 1.0 }
       result = evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
-      expect(result[0].raw_index).to eq("{ 'C': 1, 'A': 1 }")
+      expect(result[0].raw_index).to eq("{ 'C': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::OPTIONAL)
+      ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
     it "Handles equal, range and sort operators." do
-      query = { "B" => 9,"A" => { "$gt" => 27.3, "$lt" => 97.3}}
+      query = { "duration" => 50, "price" => { "$gt" => 27.3, "$lt" => 97.3}}
       sort_hash = { "C" => -1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
-      expect(result[0].raw_index).to eq("{ 'B': 1, 'C': 1, 'A': 1 }")
+      expect(result[0].raw_index).to eq("{ 'duration': 1, 'C': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
     it "Suggests a proper index for sorting purposes." do
@@ -287,6 +363,7 @@ describe Evaluator do
 
       expect(result[0].raw_index).to eq("{ 'C': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
     it "Recommends no index for queries that do not need one." do
@@ -300,62 +377,70 @@ describe Evaluator do
     end
 
     it "Recommends index which is better than existing one(coverage == none)." do
-      query = { "artist" => "bar" }
+      query = { "artist" => "Sting" }
       result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
 
       expect(result[0].raw_index).to eq("{ 'artist': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, {}, result[0].index)
     end
 
     it "Recommends index which is better than existing one(coverage == partial)." do
-      query = { "artist" => "bar", "name" => "foo" }
+      query = { "artist" => "Frank Zappa", "name" => "Apple" }
       result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
 
       expect(result[0].raw_index).to eq("{ 'artist': 1, 'name': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, {}, result[0].index)
 
-      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "foo" }
+
+      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "Apple" }
       result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
       expect(result[0].raw_index).to eq("{ 'name': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, {}, result[0].index)
     end
 
     it "Recommends index which is better than existing one(coverage == full, idealorder == false)." do
-      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "foo" }
+      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "Orange" }
       result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
       expect(result[0].raw_index).to eq("{ 'name': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
 
       query = { "duration" => 50, "price" => 20 }
       result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
       expect(result[0].raw_index).to eq("{ 'duration': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, {}, result[0].index)
 
-      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "price" => 50 }
+      query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "price" => 30 }
       sort_hash = { "rating" => 1.0 }
       result =  evaluator.evaluate_query(query,
         :sort_hash => sort_hash,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
       expect(result[0].raw_index).to eq("{ 'price': 1, 'rating': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
     # Recommended index == existing index
     it "Recommends no index which is equal to existing one." do
-      query = { "duration" => 50, "name" => "foo" }
-      result =  evaluator.evaluate_query(query, :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+      query = { "duration" => 50, "name" => "Orange" }
+      result =  evaluator.evaluate_query(query,
+                                         :namespace => test_coll_namespace)
       expect(result).to eq([])
 
-      query = { "price" => { "$gte" => 50, "$lte" => 60 }, "duration" => 50 }
+      query = { "price" => { "$gte" => 15, "$lte" => 30 }, "duration" => 50 }
       sort_hash = { "rating" => 1.0 }
-      result =  evaluator.evaluate_query(query,
+      result =  evaluator.evaluate_query(
+        query,
         :sort_hash => sort_hash,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+        :namespace => test_coll_namespace)
       expect(result).to eq([])
     end
 
@@ -364,27 +449,27 @@ describe Evaluator do
       query = { "duration" => 50}
       sort_hash = { "rating" => 1.0 }
 
-      result =  evaluator.evaluate_query(query, :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+      result =  evaluator.evaluate_query(
+        query, :namespace => test_coll_namespace)
       expect(result).to eq([])
 
-      result =  evaluator.evaluate_query(query, :sort_hash => sort_hash, :namespace => MongoMapper.database.full_collection_name(test_collection_name))
+      result =  evaluator.evaluate_query(
+        query, :sort_hash => sort_hash, :namespace => test_coll_namespace)
       expect(result).to eq([])
     end
 
     # Recommended index and existing index are logically equivalent
     it "Recommends no index which is logically equal to existing one." do
-      query = { "name" => "foo", "duration" => 50}
-      result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
-
+      query = { "name" => "Orange", "duration" => 50}
+      result =  evaluator.evaluate_query(
+        query, :namespace => test_coll_namespace)
       expect(result).to eq([])
     end
 
     it "Recommends no index when unsupported indexes encountered" do
       query = { "location" => [-100, 100] }
-      result =  evaluator.evaluate_query(query,
-        :namespace => MongoMapper.database.full_collection_name(test_collection_name))
-
+      result =  evaluator.evaluate_query(
+        query, :namespace => test_coll_namespace)
       expect(result).to eq([])
     end
 

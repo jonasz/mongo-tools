@@ -45,12 +45,22 @@ class IndexResult < EvaluationResult
   # Most of time it improves performance
   GOOD = :good
 
-  def initialize(raw_index, level)
-    super("Index recommendation: #{raw_index}", level)
-    @raw_index = raw_index
+  # returns the index serialized as string, e.g.:
+  # "{ 'price': 1, 'rating': 1, 'duration': 1 }"
+  def raw_index
+    elems = @index.map { |field, type|
+      type_str = type == Mongo::ASCENDING ? '1' : '-1'
+      "'#{field}': #{type_str}"
+    }
+    return "{ " + elems.join(", ") + " }"
   end
 
-  attr_accessor :raw_index
+  def initialize(index, level)
+    @index = index
+    super("Index recommendation: #{raw_index()}", level)
+  end
+
+  attr_accessor :index
 end
 
 
@@ -279,16 +289,6 @@ in the array is not very selective.},
     end
   end
 
-  def generate_index_suggestion recommendation
-    str = "{"
-    recommendation.each do |field|
-      str += " '" + field + "': 1,"
-    end
-    str[str.size-1] = " "
-    str[str.size] = "}"
-    return str
-  end
-
   def check_for_indexes(query_hash, sort_hash, namespace)
     #classified_fields[FieldType][FieldName]
     classified_fields = Array.new(4) {[]}
@@ -304,13 +304,27 @@ in the array is not very selective.},
     # http://java.dzone.com/articles/optimizing-mongodb-compound?mz=36885-nosql
     [EQUAL_TYPE, SORT_TYPE, RANGE_TYPE].each do |i|
       classified_fields[i].each do |field|
-        recommendation << field if recommendation.index(field) == nil
+        # if the field has not been added yet
+        if recommendation.index(field) == nil
+          recommendation << field
+        end
       end
     end
-    return [] if (recommendation.size == 0 ||
-      needs_recommendation?(classified_fields, recommendation, namespace) == false)
-    return [IndexResult.new( generate_index_suggestion(recommendation),
-      classified_fields[UNSUPPORTED_TYPE].size == 0 ? IndexResult::GOOD : IndexResult::OPTIONAL )]
+
+    if recommendation.size == 0
+      return []
+    end
+
+    if not needs_recommendation?(classified_fields, recommendation, namespace)
+      return []
+    end
+
+    index = recommendation.map {|x| [x, Mongo::ASCENDING]}
+    if classified_fields[UNSUPPORTED_TYPE].size == 0
+      return [IndexResult.new(index, IndexResult::GOOD)]
+    else
+      return [IndexResult.new(index, IndexResult::OPTIONAL)]
+    end
   end
 
   # Evaluate existing indexes against query. Similar to Dex(https://github.com/mongolab/dex).
