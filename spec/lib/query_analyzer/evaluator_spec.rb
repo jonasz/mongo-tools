@@ -37,8 +37,9 @@ describe Evaluator do
       # The server does not need to sort the outcome.
       expect(after['scanAndOrder']).to eq(nil)
     else
-      # The number of scanned objects is improved.
+      # This assertion makes sure that the testcase is of good quality.
       expect(before['nscanned']).to be > before['n']
+      # The number of scanned objects is improved.
       expect(after['nscanned']).to eq(after['n'])
     end
 
@@ -173,10 +174,10 @@ describe Evaluator do
         perform_query(
           {
             op => [
-              'field1' => 2.15,
-              'field2' => 'red',
-              'field3' => { '$ne' => 15 },
-              'field4' => { 'sub1' => 1, 'sub2' => 2 },
+              {'field1' => 2.15},
+              {'field2' => 'red'},
+              {'field3' => { '$ne' => 15 }},
+              {'field4' => { 'sub1' => 1, 'sub2' => 2 }},
             ]
           },
           [[EfficiencyResult::NEGATION, EfficiencyResult::CRITICAL]]
@@ -198,10 +199,10 @@ describe Evaluator do
       perform_query(
         {
           '$nor' => [
-            'field1' => 2.15,
-            'field2' => 'red',
-            'field3' => { '$ne' => 15 },
-            'field4' => { 'sub1' => 1, 'sub2' => 2 },
+            {'field1' => 2.15},
+            {'field2' => 'red'},
+            {'field3' => { '$ne' => 15 }},
+            {'field4' => { 'sub1' => 1, 'sub2' => 2 }},
           ]
         },
         [[EfficiencyResult::NOR, EfficiencyResult::CRITICAL],
@@ -295,6 +296,7 @@ describe Evaluator do
       sort_hash = { "C" => 1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to \
         eq("{ 'C': 1, 'duration': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
@@ -311,26 +313,29 @@ describe Evaluator do
       sort_hash = { "rating" => -1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to \
-        eq ("{ 'name': 1, 'rating': 1, 'price': 1 }")
+        eq ("{ 'name': 1, 'rating': -1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
 
       ensureIndexQuality(query, sort_hash, result[0].index)
 
 
       query = {
-        '$nor' => [
-          'field1' => 2.15,
-          'field2' => 'red',
-          'field3' => { '$ne' => 15 },
-          'field4' => { 'sub1' => 1, 'sub2' => 2 },
+        '$and' => [
+          {'artist' => 'Sting'},
+          {'duration' => 50},
+          {'price' => { '$gt' => 20 }},
+          {'rating' => 6},
         ]
       }
       result = evaluator.evaluate_query(query)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to \
-        eq("{ 'field1': 1, 'field2': 1, 'field4': 1, 'field3': 1 }")
-      expect(result[0].level).to eq(IndexResult::OPTIONAL)
+        eq("{ 'artist': 1, 'duration': 1, 'rating': 1, 'price': 1 }")
+      expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, {}, result[0].index)
     end
 
     it "Does not suggest indexes for fields with unsupported operators." do
@@ -341,6 +346,7 @@ describe Evaluator do
       sort_hash = { "C" => 1.0 }
       result = evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'C': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::OPTIONAL)
       ensureIndexQuality(query, sort_hash, result[0].index)
@@ -351,7 +357,8 @@ describe Evaluator do
       sort_hash = { "C" => -1.0 }
       result =  evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
-      expect(result[0].raw_index).to eq("{ 'duration': 1, 'C': 1, 'price': 1 }")
+      expect(result.length).to be >= 1
+      expect(result[0].raw_index).to eq("{ 'duration': 1, 'C': -1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, sort_hash, result[0].index)
     end
@@ -361,6 +368,7 @@ describe Evaluator do
       sort_hash = { "C" => 1.0 }
       result = evaluator.evaluate_query(query, :sort_hash => sort_hash)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'C': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, sort_hash, result[0].index)
@@ -381,6 +389,7 @@ describe Evaluator do
       result =  evaluator.evaluate_query(query,
         :namespace => test_coll_namespace)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'artist': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, {}, result[0].index)
@@ -391,6 +400,7 @@ describe Evaluator do
       result =  evaluator.evaluate_query(query,
         :namespace => test_coll_namespace)
 
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'artist': 1, 'name': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, {}, result[0].index)
@@ -399,6 +409,8 @@ describe Evaluator do
       query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "Apple" }
       result =  evaluator.evaluate_query(query,
         :namespace => test_coll_namespace)
+
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'name': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, {}, result[0].index)
@@ -408,12 +420,14 @@ describe Evaluator do
       query = { "duration" => { "$gte" => 50, "$lte" => 60 }, "name" => "Orange" }
       result =  evaluator.evaluate_query(query,
         :namespace => test_coll_namespace)
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'name': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
 
       query = { "duration" => 50, "price" => 20 }
       result =  evaluator.evaluate_query(query,
         :namespace => test_coll_namespace)
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'duration': 1, 'price': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, {}, result[0].index)
@@ -423,12 +437,12 @@ describe Evaluator do
       result =  evaluator.evaluate_query(query,
         :sort_hash => sort_hash,
         :namespace => test_coll_namespace)
+      expect(result.length).to be >= 1
       expect(result[0].raw_index).to eq("{ 'price': 1, 'rating': 1, 'duration': 1 }")
       expect(result[0].level).to eq(IndexResult::GOOD)
       ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
-    # Recommended index == existing index
     it "Recommends no index which is equal to existing one." do
       query = { "duration" => 50, "name" => "Orange" }
       result =  evaluator.evaluate_query(query,
@@ -444,8 +458,7 @@ describe Evaluator do
       expect(result).to eq([])
     end
 
-    # Recommended index is the prefix of existing index
-    it "Recommends no index which is the prefix of existing one" do
+    it "Recommends no index which is a prefix of existing one" do
       query = { "duration" => 50}
       sort_hash = { "rating" => 1.0 }
 
@@ -458,7 +471,6 @@ describe Evaluator do
       expect(result).to eq([])
     end
 
-    # Recommended index and existing index are logically equivalent
     it "Recommends no index which is logically equal to existing one." do
       query = { "name" => "Orange", "duration" => 50}
       result =  evaluator.evaluate_query(
@@ -466,11 +478,43 @@ describe Evaluator do
       expect(result).to eq([])
     end
 
-    it "Recommends no index when unsupported indexes encountered" do
+    it "Recommends no index when geospatial indexes are encountered" do
       query = { "location" => [-100, 100] }
       result =  evaluator.evaluate_query(
         query, :namespace => test_coll_namespace)
       expect(result).to eq([])
+    end
+
+    it "When evaluating existing indexes, does not require " +
+       "'equal and 'sort' fields to be disjoint." do
+      query = { "artist" => "Sting", "rating" => 7, "duration" => 60}
+      sort_hash = { "artist" => -1, "duration" => -1, "price" => 1 }
+
+      test_coll.ensure_index([
+        ['artist', Mongo::DESCENDING],
+        ['rating', Mongo::ASCENDING],
+        ['duration', Mongo::DESCENDING],
+        ['price', Mongo::ASCENDING],
+      ])
+
+      result = evaluator.evaluate_query(query,
+        :sort_hash => sort_hash,
+        :namespace => test_coll_namespace)
+
+      expect(result).to eq([])
+    end
+
+    it "Pays attention to the sorting order." do
+      query = { "artist" => "Sting", "rating" => 7, "duration" => 60}
+      sort_hash = { "artist" => -1, "rating" => 1.0, "duration" => -1.0, "price" => 1.0 }
+      result = evaluator.evaluate_query(query,
+        :sort_hash => sort_hash,
+        :namespace => test_coll_namespace)
+
+      expect(result.length).to be >= 1
+      expect(result[0].raw_index).to eq("{ 'artist': -1, 'rating': 1, 'duration': -1, 'price': 1 }")
+      expect(result[0].level).to eq(IndexResult::GOOD)
+      ensureIndexQuality(query, sort_hash, result[0].index)
     end
 
   end # context

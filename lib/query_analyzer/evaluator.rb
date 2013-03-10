@@ -249,28 +249,35 @@ in the array is not very selective.},
   def empty_handle(field, operator_arg)
     []
   end
+
   # ====================Indexes suggestion======================
 
   RANGE_OPERATORS = %w{ $all $not $in $ne $nin $lt $lte $gt $gte }
 
+  # Classify fields into four types and return a mapping from type symbols
+  # to arrays of fields. The types are:
+  # :equal_type - e.g. "A" => "10"
+  # :sort_type - fields that are present in the sort_hash
+  # :range_type - fieds that are used with an operator from RANGE_OPERATORS
+  # :unsupported_type - e.g. {"A" => { "$regex" => "acme.*corp.*$" }
+  def classify_fields(query_hash, sort_hash)
+    classified_fields = {
+      :equal_type => [],
+      :sort_type => [],
+      :range_type  => [],
+      :unsupported_type => [],
+    }
+    _classify_field! query_hash, classified_fields
+    classified_fields[:sort_type] = sort_hash.keys.clone()
+    return classified_fields
+  end
 
-  EQUAL_TYPE = 0
-  SORT_TYPE = 1
-  RANGE_TYPE = 2
-  UNSUPPORTED_TYPE = 3
-
-  # classify fields into four types
-  # EQUAL_TYPE: e.g. "A" => "10"
-  # SORT_TYPE: e.g. "orderby" => { "C" => 1.0 }
-  # RANGE_TYPE: #e.g. "A" => {"$gt" : 13, "$lt" : 27}
-  # UNSUPPORTED_TYPE: e.g. {"A" => { "$regex" => "acme.*corp.*$", "$options" => 'i' } }
-  def classify_field!(query_hash, classified_fields)
+  def _classify_field!(query_hash, classified_fields)
     traverse_query query_hash do |type, key, val|
       case type
       when :multiple_queries_operator
-        # e.g "$or" => [{ "A" => { "$gt" => 25.0 } }, { "b" => { "$in" => [ 1.0, 2.0, 3.0, 4.0 ] } }]
-        classified_fields[UNSUPPORTED_TYPE] << key
-        val.each { |sub| classify_field!(sub, classified_fields) }
+        # e.g "$or" => [ ... ]
+        val.each { |sub| _classify_field!(sub, classified_fields) }
       when :field_query
         #e.g. "A" => {"$gt" : 13, "$lt" : 27}
         support = true
@@ -278,52 +285,55 @@ in the array is not very selective.},
           support = false unless RANGE_OPERATORS.include? op
         end
         if support
-          classified_fields[RANGE_TYPE] << key
+          classified_fields[:range_type] << key
         else
-          classified_fields[UNSUPPORTED_TYPE] << key
+          classified_fields[:unsupported_type] << key
         end
       when :field_equality
         #e.g. "A" => "10"
-        classified_fields[EQUAL_TYPE] << key
+        classified_fields[:equal_type] << key
       end
     end
   end
 
   def check_for_indexes(query_hash, sort_hash, namespace)
-    #classified_fields[FieldType][FieldName]
-    classified_fields = Array.new(4) {[]}
-    recommendation = []
+    classified_fields = classify_fields(query_hash, sort_hash)
 
-    classify_field! query_hash, classified_fields
-
-    sort_hash.each do |key, val|
-        classified_fields[SORT_TYPE] << key
+    if has_ideal_index?(classified_fields, sort_hash, namespace)
+      return []
     end
+
+    # we are going to construct an 'ideal' index
+    recommended_index = {}
 
     # index sequence : 1.equality tests 2.sort fields 3.range filters
     # http://java.dzone.com/articles/optimizing-mongodb-compound?mz=36885-nosql
-    [EQUAL_TYPE, SORT_TYPE, RANGE_TYPE].each do |i|
-      classified_fields[i].each do |field|
-        # if the field has not been added yet
-        if recommendation.index(field) == nil
-          recommendation << field
+    [:equal_type, :sort_type, :range_type].each do |field_type|
+      classified_fields[field_type].each do |field|
+
+        if recommended_index.keys.include? field
+          # this field has already been handled
+          next
         end
+
+        order = Mongo::ASCENDING
+        if sort_hash.include? field
+          order = sort_hash[field] > 0 ? Mongo::ASCENDING : Mongo::DESCENDING
+        end
+
+        recommended_index[field] = order
       end
     end
 
-    if recommendation.size == 0
+    if recommended_index.size == 0
       return []
     end
 
-    if not needs_recommendation?(classified_fields, recommendation, namespace)
-      return []
-    end
-
-    index = recommendation.map {|x| [x, Mongo::ASCENDING]}
-    if classified_fields[UNSUPPORTED_TYPE].size == 0
-      return [IndexResult.new(index, IndexResult::GOOD)]
+    recommended_index = recommended_index.to_a
+    if classified_fields[:unsupported_type].size == 0
+      return [IndexResult.new(recommended_index, IndexResult::GOOD)]
     else
-      return [IndexResult.new(index, IndexResult::OPTIONAL)]
+      return [IndexResult.new(recommended_index, IndexResult::OPTIONAL)]
     end
   end
 
@@ -336,52 +346,84 @@ in the array is not very selective.},
   #  Partial describes any value of fields covered value between None and Full.
   # -Order (ideal or not)
   #  describes whether the index is partially-ordered according to ideal index order: Equivalence > Sort > Range
-  def generate_index_report(index, classified_fields, recommendation)
-    max_equal_cnt = classified_fields[EQUAL_TYPE].length
-    max_sort_cnt = max_equal_cnt + classified_fields[SORT_TYPE].length
-    max_range_cnt = max_sort_cnt + classified_fields[RANGE_TYPE].length
-    coverage = 'none'
-    supported = true
-    ideal_order = true
-    query_fields_covered = 0
+  def generate_index_report(index, classified_fields, sort_hash)
+    eq_fields = classified_fields[:equal_type].uniq
+    sort_fields = classified_fields[:sort_type] # these are already unique
+    range_fields = classified_fields[:range_type].uniq
+    all_fields = eq_fields | sort_fields | range_fields
 
-    index.each do |field_name,val|
-      if val == '2d'
-        supported = false if recommendation.include? field_name
-        break
-      end
-      if !(recommendation.include? field_name)
-        break
-      end
-      if query_fields_covered == 0
-        coverage = 'partial'
-      end
-      if query_fields_covered < max_equal_cnt
-        ideal_order = false if !(classified_fields[EQUAL_TYPE].include? field_name)
-      elsif query_fields_covered < max_sort_cnt
-        ideal_order = false if !(classified_fields[SORT_TYPE].include? field_name)
-      elsif query_fields_covered < max_range_cnt
-        ideal_order = false if !(classified_fields[RANGE_TYPE].include? field_name)
-      end
-      query_fields_covered += 1
+    # we are interested in the maximal prefix of the index that
+    # contains only fields from the query
+    index = index.take_while{|k,v| all_fields.include? k}
+    index = Hash[*index.flatten]
+
+    if index.values.include? "2d"
+      return {:geospatial => true, :coverage => nil, :ideal_order => nil}
     end
-    coverage = 'full' if query_fields_covered == max_range_cnt
-    return {'coverage' => coverage, 'ideal_order' => ideal_order, 'supported'=> supported}
+
+    # evaluate the coverage quality
+    covered_fields = (index.keys & all_fields).length
+    if covered_fields == 0
+      coverage = :none
+    elsif covered_fields == all_fields.length
+      coverage = :full
+    else
+      coverage = :partial
+    end
+
+    # evaluate the order quality
+    ideal_order = true
+
+    # eq_fields should be contained in a contiguous prefix of the index
+    prefix = index.keys.take_while{|k,v| eq_fields.include? k}
+    if prefix.sort != eq_fields.sort
+      ideal_order = false
+    end
+
+    # when we discard eq_fields, the remaining sort_fields should be equal to
+    # a contiguous prefix of the index
+    remaining = sort_fields - eq_fields
+    remaining_index = index.keys.reject{|field| eq_fields.include? field}
+    if remaining_index.take(remaining.length) != remaining
+      ideal_order = false
+    end
+
+    # index has to be sorted in the same manner as we require in sort_hash
+    # (even if a field is included in eq_fields)
+    sort_manner = index.find_all{|k,v| sort_hash.keys.include? k}
+    if sort_manner != sort_hash.to_a
+      ideal_order = false
+    end
+
+    return {:coverage => coverage, :ideal_order => ideal_order, :geospatial=> false}
   end
 
-  # Return false if the existing indexes is full coverage and in ideal order OR unsupported
-  # otherwise return true.
-  def needs_recommendation?(classified_fields, recommendation, namespace)
+  # This method returns true if it is able to detect that there is an ideal
+  # index for the given query (full coverage, ideal order). If there is a
+  # geospatial index for that query, it is also considered to be optimal.
+  # Note that false may also be returned when get_index_information is not
+  # succesful.
+  def has_ideal_index?(classified_fields, sort_hash, namespace)
     indexes = get_index_information(namespace)
-    need = true
-    if indexes != nil
-      indexes.each do |_,index|
-        index_report = generate_index_report(index['key'], classified_fields, recommendation)
-        need = false if (!index_report['supported'] ||
-          (index_report['coverage'] == 'full' && index_report['ideal_order']))
+    if indexes.nil?
+      return false
+    end
+
+    indexes.each do |_, index|
+      report = generate_index_report(index['key'], classified_fields, sort_hash)
+
+      # TODO - maybe we can evaluate geospatial indexes instead assuming that
+      # they are optimal?
+      if report[:geospatial] == true
+        return true
+      end
+
+      if report[:coverage] == :full and report[:ideal_order] == true
+        return true
       end
     end
-    return need
+
+    return false
   end
   # ============================================================
 
